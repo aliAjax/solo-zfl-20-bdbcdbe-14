@@ -30,3 +30,16 @@ curl -X POST http://127.0.0.1:3020/batches \
   -H 'Content-Type: application/json' \
   -d '{"name":"六月小批修补","damageIds":["damage_demo_1","damage_demo_2"]}'
 ```
+
+## 多版本校勘服务
+
+`collation/` 目录是独立的校勘服务（默认端口 3030）：按列登记各版本字序、
+异体字归并、多版对齐（插入/缺失/换位/缺页）、自动推选底本、人工锁定、
+断点续算与结果回滚。
+
+```bash
+node collation/server.js     # 启动
+node --test collation/       # 运行测试
+```
+
+详见 [collation/README.md](collation/README.md)。
