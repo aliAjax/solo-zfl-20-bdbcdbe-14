@@ -1,25 +1,34 @@
 "use strict";
 
 /**
- * 对齐引擎：把某一版本的列字序列与底本字序列对齐。
+ * 对齐引擎（第二版）：LCS 锚点 + 移动块识别。
  *
  * 字流模型：
  *  - 普通字：{ kind: "char", raw: 原字, norm: 归并后的标准字 }
- *  - 缺页标记：{ kind: "gap" }，一段连续缺页列合并为一个标记，
- *    对齐时可以不花代价地“覆盖”底本中任意长度的连续区段（缺页不计缺字）。
+ *  - 缺页标记：{ kind: "gap" }，连续缺页列合并为一个边界；
+ *    落在缺页区域的底本字记 missing_page，代价为 0（缺页不计缺字）。
  *
- * 计权规则（段级，详见 README）：
+ * 对齐流程（确定性的）：
+ *  1. 版本字流拆出实字与缺页边界；
+ *  2. LCS 求锚点（两序列中相对顺序不变的公共字），前向贪心回溯，结果确定；
+ *  3. 非锚点内容：底本侧为缺失块，版本侧为插入块（缺页边界会切断插入块，
+ *     使移动块不会横跨缺页）；
+ *  4. 换位识别：内容完全相同的缺失块与插入块配成一次换位——不限块长、
+ *     不限距离；候选按（块长降序、位置升序）排序后贪心选配，每块只用一次，
+ *     重复字与交叉移动因此也有确定结果；
+ *  5. 剩余块按“区域”（相邻锚点之间）结算：
+ *     - 同区缺失块+插入块 → 逐字替换，多出部分成一段插入/缺失；
+ *     - 含缺页边界的区域 → 底本字记 missing_page（0），版本字记一段插入。
+ *
+ * 计权规则（段级）：
  *  - 替换：每字 1
  *  - 插入 / 缺失：每个连续段 1（段内长度不计）
- *  - 换位：每处 1（相邻互换或整块移动均只算一次）
+ *  - 换位：每处 1（任意连续块只移动一次都按一次计）
  *  - 缺页：0
  */
 
 const CHAR = "char";
 const GAP = "gap";
-
-const MAX_TRANSPOSE_LEN = 8; // 参与换位的片段最大长度
-const MAX_TRANSPOSE_SPAN = 8; // 换位两端允许的最大间距
 
 function charToken(raw, norm) {
   return { kind: CHAR, raw, norm };
@@ -29,198 +38,43 @@ function gapToken() {
   return { kind: GAP };
 }
 
-/**
- * 动态规划对齐。baseChars 为标准字数组（底本侧，不含缺页标记），
- * tokens 为版本侧字流（可含缺页标记）。
- * 返回字级微操作序列（前序）：match / sub / del / ins / mp。
- */
-function alignRaw(baseChars, tokens) {
-  const n = baseChars.length;
-  const m = tokens.length;
-  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(Infinity));
-  const parent = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(null));
-  dp[0][0] = 0;
-
-  for (let i = 0; i <= n; i++) {
-    for (let j = 0; j <= m; j++) {
-      if (i === 0 && j === 0) continue;
-      const candidates = [];
-      if (j === 0) {
-        candidates.push({
-          cost: dp[i - 1][0] + 1,
-          from: [i - 1, 0],
-          op: { type: "del", pos: i - 1, char: baseChars[i - 1] }
-        });
-      } else {
-        const tok = tokens[j - 1];
-        if (tok.kind === CHAR) {
-          if (i > 0) {
-            const equal = baseChars[i - 1] === tok.norm;
-            candidates.push({
-              cost: dp[i - 1][j - 1] + (equal ? 0 : 1),
-              from: [i - 1, j - 1],
-              op: equal
-                ? { type: "match", pos: i - 1, char: tok.norm, raw: tok.raw }
-                : { type: "sub", pos: i - 1, base: baseChars[i - 1], char: tok.norm, raw: tok.raw }
-            });
-            candidates.push({
-              cost: dp[i - 1][j] + 1,
-              from: [i - 1, j],
-              op: { type: "del", pos: i - 1, char: baseChars[i - 1] }
-            });
-          }
-          candidates.push({
-            cost: dp[i][j - 1] + 1,
-            from: [i, j - 1],
-            op: { type: "ins", char: tok.norm, raw: tok.raw }
-          });
-        } else {
-          // 缺页标记：优先“空消耗”（同分时让正常字对齐优先），
-          // 其次免费覆盖一个底本字（缺页区段，不计缺字）。
-          candidates.push({ cost: dp[i][j - 1], from: [i, j - 1], op: null });
-          if (i > 0) {
-            candidates.push({
-              cost: dp[i - 1][j],
-              from: [i - 1, j],
-              op: { type: "mp", pos: i - 1, char: baseChars[i - 1] }
-            });
-          }
-        }
-      }
-      let best = null;
-      for (const c of candidates) {
-        if (!Number.isFinite(c.cost)) continue;
-        if (!best || c.cost < best.cost) best = c; // 同分取先，保证确定性
-      }
-      if (best) {
-        dp[i][j] = best.cost;
-        parent[i][j] = best;
-      }
+/** LCS 长度表（后缀 DP）。 */
+function lcsTable(a, b) {
+  const n = a.length;
+  const m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
     }
   }
-
-  const ops = [];
-  let i = n;
-  let j = m;
-  while (i > 0 || j > 0) {
-    const p = parent[i][j];
-    if (!p) break;
-    if (p.op) ops.push(p.op);
-    i = p.from[0];
-    j = p.from[1];
-  }
-  ops.reverse();
-  return { ops, cost: dp[n][m] };
+  return dp;
 }
 
-/** 把字级微操作合并为段级操作，并识别换位。 */
-function buildOps(rawOps, baseLength) {
-  const ops = [];
-  const columns = new Array(baseLength).fill(null);
-  let consumed = 0; // 已消费的底本字数（用于给插入段定位）
+/**
+ * LCS 锚点：前向贪心回溯（能配则配、否则先推进底本侧），
+ * 同一输入永远得到同一锚点序列。返回 [[底本下标, 版本下标], ...]。
+ */
+function lcsAnchors(a, b) {
+  const dp = lcsTable(a, b);
+  const anchors = [];
   let i = 0;
-  while (i < rawOps.length) {
-    const op = rawOps[i];
-    if (op.type === "match") {
-      columns[op.pos] = { op: "match", norm: op.char, raw: op.raw };
-      consumed = op.pos + 1;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j] && dp[i][j] === dp[i + 1][j + 1] + 1) {
+      anchors.push([i, j]);
       i++;
-      continue;
-    }
-    if (op.type === "sub") {
-      columns[op.pos] = { op: "substitute", norm: op.char, raw: op.raw };
-      ops.push({ type: "substitute", pos: op.pos, base: op.base, char: op.char, raw: op.raw });
-      consumed = op.pos + 1;
+      j++;
+    } else if (dp[i][j] === dp[i + 1][j]) {
       i++;
-      continue;
-    }
-    if (op.type === "del" || op.type === "mp") {
-      const isMp = op.type === "mp";
-      const chars = [];
-      const start = op.pos;
-      let j = i;
-      while (j < rawOps.length && rawOps[j].type === op.type) {
-        chars.push(rawOps[j].char);
-        columns[rawOps[j].pos] = { op: isMp ? "missing_page" : "missing" };
-        j++;
-      }
-      consumed = start + chars.length;
-      ops.push({ type: isMp ? "missing_page" : "missing", pos: start, chars });
-      i = j;
-      continue;
-    }
-    // ins 连续段
-    const chars = [];
-    const raws = [];
-    const at = consumed;
-    let j = i;
-    while (j < rawOps.length && rawOps[j].type === "ins") {
-      chars.push(rawOps[j].char);
-      raws.push(rawOps[j].raw);
+    } else {
       j++;
     }
-    ops.push({ type: "insert", at, chars, raws });
-    i = j;
   }
-  return { ops: mergeTranspositions(ops), columns };
+  return anchors;
 }
 
-/**
- * 换位识别（启发式，只算一次）：
- *  T1 相邻互换：底本 XY 对版本 YX（两个相邻替换字交叉相同）→ 一次换位。
- *  T2 整块移动：缺失段与插入段字序列完全相同且相距不超过 MAX_TRANSPOSE_SPAN → 一次换位。
- */
-function mergeTranspositions(ops) {
-  const out = [];
-  for (let k = 0; k < ops.length; k++) {
-    const a = ops[k];
-    const b = ops[k + 1];
-    if (
-      a && b &&
-      a.type === "substitute" && b.type === "substitute" &&
-      b.pos === a.pos + 1 &&
-      a.base === b.char && b.base === a.char &&
-      a.base !== a.char
-    ) {
-      out.push({ type: "transposition", pos: a.pos, baseChars: [a.base, b.base], chars: [a.char, b.char] });
-      k++;
-    } else {
-      out.push(a);
-    }
-  }
-
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (let mi = 0; mi < out.length && !changed; mi++) {
-      const miss = out[mi];
-      if (miss.type !== "missing" || miss.chars.length > MAX_TRANSPOSE_LEN) continue;
-      for (let ii = 0; ii < out.length; ii++) {
-        const ins = out[ii];
-        if (ins.type !== "insert") continue;
-        if (ins.chars.join("") !== miss.chars.join("")) continue;
-        if (Math.abs(ins.at - miss.pos) > MAX_TRANSPOSE_SPAN) continue;
-        const trans = {
-          type: "transposition",
-          pos: miss.pos,
-          baseChars: miss.chars,
-          chars: ins.chars,
-          movedTo: ins.at
-        };
-        out.splice(Math.max(mi, ii), 1);
-        out.splice(Math.min(mi, ii), 1);
-        out.push(trans);
-        changed = true;
-        break;
-      }
-    }
-  }
-
-  out.sort((x, y) => (x.pos ?? x.at) - (y.pos ?? y.at));
-  return out;
-}
-
-/** 段级计权：替换每字 1，插入/缺失每段 1，换位每处 1，缺页 0。 */
+/** 段级计权。 */
 function scoreOps(ops) {
   const stats = {
     substitute: 0,
@@ -257,14 +111,256 @@ function scoreOps(ops) {
 }
 
 /**
- * 完整对齐：返回段级差异 ops、逐位列信息 columns（供支撑统计）、
- * 段级代价 cost 与统计 stats。
+ * 由给定锚点序列构建对齐结果。
+ * B：底本标准字数组；vToks：版本侧实字 token；V：其标准字；
+ * gapBefore：缺页边界集合；anchors：[[底本下标, 版本下标], ...]（递增）；
+ * allowMoves：是否进行换位配对（调用方会比较两种结果取代价低者）。
  */
-function alignDetailed(baseChars, tokens) {
-  const { ops: raw } = alignRaw(baseChars, tokens);
-  const { ops, columns } = buildOps(raw, baseChars.length);
+function alignWithAnchors(B, vToks, V, gapBefore, anchors, allowMoves) {
+  const anchorB = new Set(anchors.map(([bi]) => bi));
+  const anchorV = new Set(anchors.map(([, vi]) => vi));
+  const anchorBList = anchors.map(([bi]) => bi);
+  const anchorVList = anchors.map(([, vi]) => vi);
+  const regionOf = (idx, anchorIdxs) => {
+    let r = 0;
+    for (const a of anchorIdxs) {
+      if (a < idx) r++;
+      else break;
+    }
+    return r;
+  };
+
+  // 3. 缺失块（底本侧非锚点连续段）
+  const dChunks = [];
+  {
+    let cur = null;
+    for (let i = 0; i < B.length; i++) {
+      if (anchorB.has(i)) {
+        cur = null;
+        continue;
+      }
+      if (!cur) {
+        cur = { start: i, chars: [], region: regionOf(i, anchorBList) };
+        dChunks.push(cur);
+      }
+      cur.chars.push(B[i]);
+    }
+  }
+  // 插入块（版本侧非锚点连续段，缺页边界切断——移动块不得横跨缺页）
+  const iChunks = [];
+  {
+    let cur = null;
+    for (let j = 0; j < V.length; j++) {
+      if (anchorV.has(j)) {
+        cur = null;
+        continue;
+      }
+      if (!cur || gapBefore.has(j)) {
+        cur = { start: j, chars: [], raws: [], region: regionOf(j, anchorVList) };
+        iChunks.push(cur);
+      }
+      cur.chars.push(V[j]);
+      cur.raws.push(vToks[j].raw);
+    }
+  }
+  // 含缺页边界的区域
+  const gapRegions = new Set();
+  for (const k of gapBefore) gapRegions.add(regionOf(k, anchorVList));
+
+  // 4. 换位配对：缺失块与插入块的公共连续子块（极大），不限长度与距离；
+  //    候选按（块长降序、底本位置、版本位置）排序后贪心选配，各位点只用一次。
+  //    相邻的多个移动块（如交叉移动）因此能拆成多次换位，重复字也有确定结果。
+  //    allowMoves 为假时跳过配对（调用方比较含/不含换位两种结果取代价低者）。
+  const candidates = [];
+  if (allowMoves) {
+    for (let di = 0; di < dChunks.length; di++) {
+      for (let ii = 0; ii < iChunks.length; ii++) {
+        const d = dChunks[di];
+        const ic = iChunks[ii];
+        for (let s = 0; s < d.chars.length; s++) {
+          for (let t = 0; t < ic.chars.length; t++) {
+            if (d.chars[s] !== ic.chars[t]) continue;
+            if (s > 0 && t > 0 && d.chars[s - 1] === ic.chars[t - 1]) continue; // 非极大起点
+            let L = 0;
+            while (s + L < d.chars.length && t + L < ic.chars.length && d.chars[s + L] === ic.chars[t + L]) L++;
+            candidates.push({ di, ii, dOff: s, iOff: t, len: L, dStart: d.start + s, iStart: ic.start + t });
+          }
+        }
+      }
+    }
+  }
+  candidates.sort((x, y) => y.len - x.len || x.dStart - y.dStart || x.iStart - y.iStart);
+  const dUsed = dChunks.map((c) => new Array(c.chars.length).fill(false));
+  const iUsed = iChunks.map((c) => new Array(c.chars.length).fill(false));
+  const moves = [];
+  for (const c of candidates) {
+    let free = true;
+    for (let k = 0; k < c.len; k++) {
+      if (dUsed[c.di][c.dOff + k] || iUsed[c.ii][c.iOff + k]) {
+        free = false;
+        break;
+      }
+    }
+    if (!free) continue;
+    for (let k = 0; k < c.len; k++) {
+      dUsed[c.di][c.dOff + k] = true;
+      iUsed[c.ii][c.iOff + k] = true;
+    }
+    moves.push({
+      pos: c.dStart,
+      chars: dChunks[c.di].chars.slice(c.dOff, c.dOff + c.len),
+      movedTo: c.iStart
+    });
+  }
+
+  // 5. 区域结算：未被换位消费的剩余连续小段
+  const dRuns = []; // { positions, chars, region }
+  dChunks.forEach((c, di) => {
+    let k = 0;
+    while (k < c.chars.length) {
+      if (dUsed[di][k]) {
+        k++;
+        continue;
+      }
+      let e = k;
+      while (e < c.chars.length && !dUsed[di][e]) e++;
+      const positions = [];
+      for (let p = k; p < e; p++) positions.push(c.start + p);
+      dRuns.push({ positions, chars: c.chars.slice(k, e), region: c.region });
+      k = e;
+    }
+  });
+  const iRuns = []; // { start, chars, raws, region }
+  iChunks.forEach((c, ii) => {
+    let k = 0;
+    while (k < c.chars.length) {
+      if (iUsed[ii][k]) {
+        k++;
+        continue;
+      }
+      let e = k;
+      while (e < c.chars.length && !iUsed[ii][e]) e++;
+      iRuns.push({ start: c.start + k, chars: c.chars.slice(k, e), raws: c.raws.slice(k, e), region: c.region });
+      k = e;
+    }
+  });
+
+  const dByRegion = new Map();
+  for (const r of dRuns) {
+    if (!dByRegion.has(r.region)) dByRegion.set(r.region, []);
+    dByRegion.get(r.region).push(r);
+  }
+  const iByRegion = new Map();
+  for (const r of iRuns) {
+    if (!iByRegion.has(r.region)) iByRegion.set(r.region, []);
+    iByRegion.get(r.region).push(r);
+  }
+  const allRegions = new Set([...dByRegion.keys(), ...iByRegion.keys(), ...gapRegions]);
+
+  const ops = [];
+  const columns = new Array(B.length).fill(null);
+  for (const [bi, vi] of anchors) {
+    columns[bi] = { op: "match", norm: B[bi], raw: vToks[vi].raw };
+  }
+  for (const m of moves) {
+    ops.push({ type: "transposition", pos: m.pos, baseChars: m.chars, chars: m.chars, movedTo: m.movedTo });
+    m.chars.forEach((_, k) => {
+      columns[m.pos + k] = { op: "transposition" };
+    });
+  }
+  const regionEndB = (r) => (r < anchors.length ? anchors[r][0] : B.length);
+
+  /** 把一串剩余底本位（含位置）按位置连续性切成 missing/missing_page 段 */
+  const emitMissing = (type, positions, chars) => {
+    let s = 0;
+    while (s < positions.length) {
+      let e = s;
+      while (e + 1 < positions.length && positions[e + 1] === positions[e] + 1) e++;
+      ops.push({ type, pos: positions[s], chars: chars.slice(s, e + 1) });
+      for (let k = s; k <= e; k++) columns[positions[k]] = { op: type };
+      s = e + 1;
+    }
+  };
+
+  for (const r of [...allRegions].sort((a, b) => a - b)) {
+    const dList = dByRegion.get(r) || [];
+    const iList = iByRegion.get(r) || [];
+    const dPositions = dList.flatMap((x) => x.positions);
+    const dChars = dList.flatMap((x) => x.chars);
+    const iChars = iList.flatMap((x) => x.chars);
+    const iRaws = iList.flatMap((x) => x.raws);
+    if (gapRegions.has(r)) {
+      // 缺页区域：底本字记缺页（0 代价），版本实字记一段插入
+      if (dPositions.length) emitMissing("missing_page", dPositions, dChars);
+      if (iChars.length) ops.push({ type: "insert", at: regionEndB(r), chars: iChars, raws: iRaws });
+      continue;
+    }
+    const L = Math.min(dChars.length, iChars.length);
+    for (let k = 0; k < L; k++) {
+      ops.push({ type: "substitute", pos: dPositions[k], base: dChars[k], char: iChars[k], raw: iRaws[k] });
+      columns[dPositions[k]] = { op: "substitute", norm: iChars[k], raw: iRaws[k] };
+    }
+    if (dChars.length > L) emitMissing("missing", dPositions.slice(L), dChars.slice(L));
+    if (iChars.length > L) ops.push({ type: "insert", at: regionEndB(r), chars: iChars.slice(L), raws: iRaws.slice(L) });
+  }
+
+  ops.sort((x, y) => (x.pos ?? x.at) - (y.pos ?? y.at));
   const stats = scoreOps(ops);
   return { ops, columns, cost: stats.cost, stats };
+}
+
+/**
+ * 完整对齐：底本标准字数组 × 版本字流（可含缺页标记）。
+ * 候选空间 = {正向锚点, 反向锚点转置} × {含换位配对, 不含换位配对}，
+ * 取代价最低的结果；同分按「正向锚点优先、含换位优先」确定唯一输出。
+ * 代价矩阵在调用方另以双向取小兜底，保证严格正反一致。
+ * 返回 { ops, columns, cost, stats }：
+ *  - ops：段级差异（substitute / insert / missing / missing_page / transposition）；
+ *  - columns：逐底本位的对齐信息（支撑统计用，match 才算支撑）；
+ *  - cost：段级总代价。
+ */
+function alignDetailed(baseChars, tokens) {
+  const B = [...baseChars];
+
+  // 拆出实字与缺页边界（gapBefore：版本实字下标 k 之前存在缺页边界）
+  const vToks = [];
+  const gapBefore = new Set();
+  let pendingGap = false;
+  for (const t of tokens) {
+    if (t.kind === GAP) {
+      pendingGap = true;
+      continue;
+    }
+    if (pendingGap) {
+      gapBefore.add(vToks.length);
+      pendingGap = false;
+    }
+    vToks.push(t);
+  }
+  if (pendingGap) gapBefore.add(vToks.length);
+  const V = vToks.map((t) => t.norm);
+
+  const anchorSets = [lcsAnchors(B, V)];
+  // 反向锚点转置回来仍是 (B, V) 的合法锚点序列，坐标不变
+  const transposed = lcsAnchors(V, B).map(([vi, bi]) => [bi, vi]);
+  if (!sameAnchorSeq(anchorSets[0], transposed)) anchorSets.push(transposed);
+
+  let best = null;
+  for (const anchors of anchorSets) {
+    for (const allowMoves of [true, false]) {
+      const r = alignWithAnchors(B, vToks, V, gapBefore, anchors, allowMoves);
+      if (!best || r.cost < best.cost) best = r;
+    }
+  }
+  return best;
+}
+
+function sameAnchorSeq(a, b) {
+  if (a.length !== b.length) return false;
+  for (let k = 0; k < a.length; k++) {
+    if (a[k][0] !== b[k][0] || a[k][1] !== b[k][1]) return false;
+  }
+  return true;
 }
 
 module.exports = {
@@ -272,8 +368,6 @@ module.exports = {
   GAP,
   charToken,
   gapToken,
-  alignRaw,
-  alignDetailed,
-  MAX_TRANSPOSE_LEN,
-  MAX_TRANSPOSE_SPAN
+  lcsAnchors,
+  alignDetailed
 };

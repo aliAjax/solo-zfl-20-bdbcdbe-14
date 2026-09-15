@@ -78,22 +78,32 @@ function tokenChars(tokens) {
   return tokens.filter((t) => t.kind === CHAR).map((t) => t.norm);
 }
 
-/** 代价矩阵需要的有序版本对：[底本候选, 比对版本]。 */
+/** 代价矩阵需要的无序版本对：[版本A, 版本B]（每对只算一次，双向取小）。 */
 function computePairs(versions) {
   const pairs = [];
-  for (const b of versions) {
-    for (const v of versions) {
-      if (b.id !== v.id) pairs.push([b.id, v.id]);
+  for (let i = 0; i < versions.length; i++) {
+    for (let j = i + 1; j < versions.length; j++) {
+      pairs.push([versions[i].id, versions[j].id]);
     }
   }
   return pairs;
 }
 
+/** 一对版本的对称代价：正反两向对齐，取较小者（正反一致由构造保证）。 */
+function pairCost(tokensA, charsA, tokensB, charsB) {
+  const ab = alignDetailed(charsA, tokensB).cost;
+  const ba = alignDetailed(charsB, tokensA).cost;
+  return Math.min(ab, ba);
+}
+
 /**
  * 底本选择：总编辑代价最小；同分先早登记（seq 小），再按版本编号 code，最后按内部 id。
+ * 不含实字的版本（整本缺页）不作底本候选，除非所有版本都缺页。
  */
-function selectBase(versions, totals) {
-  const sorted = [...versions].sort((a, b) => {
+function selectBase(versions, totals, eligibleIds) {
+  let pool = eligibleIds ? versions.filter((v) => eligibleIds.has(v.id)) : versions;
+  if (!pool.length) pool = versions;
+  const sorted = [...pool].sort((a, b) => {
     const d = (totals[a.id] || 0) - (totals[b.id] || 0);
     if (d !== 0) return d;
     if (a.seq !== b.seq) return a.seq - b.seq;
@@ -142,12 +152,14 @@ function finalizeResult({ text, versions, groups, locks, costMatrix, now }) {
     for (const o of versions) {
       if (o.id === v.id) continue;
       const cached = costMatrix && costMatrix[v.id] && costMatrix[v.id][o.id];
-      total += cached !== undefined ? cached : alignDetailed(charsByV[v.id], tokensByV[o.id]).cost;
+      total += cached !== undefined ? cached : pairCost(tokensByV[v.id], charsByV[v.id], tokensByV[o.id], charsByV[o.id]);
     }
     totals[v.id] = total;
   }
 
-  const base = selectBase(versions, totals);
+  // 底本候选须含实字（整本缺页不作底本，除非全部如此）
+  const eligible = new Set(versions.filter((v) => charsByV[v.id].length > 0).map((v) => v.id));
+  const base = selectBase(versions, totals, eligible);
 
   // 应用人工锁定：锁定段按绝对位置钉在底本上，重算不移动。
   const baseChars = [...charsByV[base.id]];
@@ -210,6 +222,7 @@ module.exports = {
   versionTokens,
   tokenChars,
   computePairs,
+  pairCost,
   selectBase,
   finalizeResult
 };

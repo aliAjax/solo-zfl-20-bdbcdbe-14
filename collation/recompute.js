@@ -14,9 +14,9 @@ const {
   versionTokens,
   tokenChars,
   computePairs,
+  pairCost,
   finalizeResult
 } = require("./engine");
-const { alignDetailed } = require("./align");
 
 function now() {
   return new Date().toISOString();
@@ -119,9 +119,11 @@ async function runJob(jobId, { pairBudget = Infinity } = {}) {
 
   let budget = pairBudget;
   while (job.cursor < job.pairs.length && budget > 0) {
-    const [bId, vId] = job.pairs[job.cursor];
-    const cost = alignDetailed(charsByV[bId] || [], tokensByV[vId] || []).cost;
-    (job.costMatrix[bId] = job.costMatrix[bId] || {})[vId] = cost;
+    const [aId, bId] = job.pairs[job.cursor];
+    // 无序对：正反两向对齐取较小代价，矩阵两格同值（正反一致）
+    const cost = pairCost(tokensByV[aId] || [], charsByV[aId] || [], tokensByV[bId] || [], charsByV[bId] || []);
+    (job.costMatrix[aId] = job.costMatrix[aId] || {})[bId] = cost;
+    (job.costMatrix[bId] = job.costMatrix[bId] || {})[aId] = cost;
     job.cursor++;
     budget--;
   }

@@ -28,8 +28,11 @@ test("换位：相邻互换只算一次", () => {
   assert.equal(r.stats.transposition, 1);
   assert.equal(r.ops.length, 1);
   assert.equal(r.ops[0].type, "transposition");
-  assert.deepEqual(r.ops[0].baseChars, ["甲", "乙"]);
-  assert.deepEqual(r.ops[0].chars, ["乙", "甲"]);
+  // 视为「甲」从首位移到末位（移动块取法确定）
+  assert.deepEqual(r.ops[0].baseChars, ["甲"]);
+  assert.deepEqual(r.ops[0].chars, ["甲"]);
+  assert.equal(r.ops[0].pos, 0);
+  assert.equal(r.ops[0].movedTo, 1);
 });
 
 test("换位：整块移动只算一次", () => {
@@ -332,13 +335,13 @@ test("重算断点续跑：暂停不污染旧结果，中断后可续跑完成",
   const before = await api("GET", `/texts/${text.id}/collation`);
   assert.equal(before.status, 200);
 
-  // 3 个版本共 6 对，预算 2 → 暂停在游标 2
+  // 3 个版本共 3 个无序对，预算 2 → 暂停在游标 2
   const start = await api("POST", `/texts/${text.id}/recompute`, { pairBudget: 2 });
   assert.equal(start.status, 202);
   const job = start.body.data;
   assert.equal(job.status, "running");
   assert.equal(job.cursor, 2);
-  assert.equal(job.pairs.length, 6);
+  assert.equal(job.pairs.length, 3);
 
   // 暂停期间查询仍返回上一份完整结果
   const during = await api("GET", `/texts/${text.id}/collation`);
@@ -358,6 +361,138 @@ test("重算断点续跑：暂停不污染旧结果，中断后可续跑完成",
   const resumed = await api("POST", `/jobs/${job.id}/resume`);
   assert.equal(resumed.status, 200);
   assert.equal(resumed.body.data.status, "done");
-  assert.equal(resumed.body.data.cursor, 6);
+  assert.equal(resumed.body.data.cursor, 3);
   assert.equal(resumed.body.collation.baseText, "天地玄黄");
+});
+
+// ---------------- 换位可靠性（第二版） ----------------
+
+test("换位：远距移动不受距离限制", () => {
+  // 「乙」从第 2 位移到末尾，跨越 10 字（旧实现的 8 字窗口之外）
+  const base = [..."甲乙丙丁戊己庚辛壬癸子"];
+  const moved = toks("甲丙丁戊己庚辛壬癸子乙");
+  const r = alignDetailed(base, moved);
+  assert.equal(r.cost, 1);
+  assert.equal(r.stats.transposition, 1);
+  assert.equal(r.stats.missing, 0);
+  assert.equal(r.stats.insert, 0);
+  assert.deepEqual(r.ops[0].baseChars, ["乙"]);
+  assert.equal(r.ops[0].movedTo, 10);
+});
+
+test("换位：长块移动不受长度限制（块长可达全文一半以上）", () => {
+  // 前半块「甲乙丙丁戊」整体移到末尾；旧实现会被替换操作吞掉（代价 10）
+  const base = [..."甲乙丙丁戊己庚辛壬癸"];
+  const moved = toks("己庚辛壬癸甲乙丙丁戊");
+  const r = alignDetailed(base, moved);
+  assert.equal(r.cost, 1);
+  assert.equal(r.stats.transposition, 1);
+  assert.equal(r.stats.substitute, 0);
+  assert.equal(r.ops[0].baseChars.length, 5);
+});
+
+test("换位：重复字不产生幻影换位", () => {
+  // 纯缺失：不能拿结尾相同的字凑换位
+  let r = alignDetailed([..."甲甲"], toks("甲"));
+  assert.equal(r.cost, 1);
+  assert.equal(r.stats.missing, 1);
+  assert.equal(r.stats.transposition, 0);
+  // 纯插入：同上
+  r = alignDetailed([..."甲乙丙甲"], toks("甲乙丙甲甲"));
+  assert.equal(r.cost, 1);
+  assert.equal(r.stats.insert, 1);
+  assert.equal(r.stats.transposition, 0);
+  // 重复字的真实移动：确定地识别为一次换位
+  r = alignDetailed([..."甲乙甲"], toks("甲甲乙"));
+  assert.equal(r.cost, 1);
+  assert.equal(r.stats.transposition, 1);
+  // 同一输入永远同一结果（确定性）
+  const again = alignDetailed([..."甲乙甲"], toks("甲甲乙"));
+  assert.deepEqual(again.ops, r.ops);
+});
+
+test("换位：交叉移动确定地计为两次", () => {
+  // 「丁丁」与「丙丙」隔着「乙」交叉对调：两块各移动一次
+  const r = alignDetailed([..."甲丁丁乙丙丙戊"], toks("甲丙丙乙丁丁戊"));
+  assert.equal(r.stats.transposition, 2);
+  assert.equal(r.cost, 2);
+  const blocks = r.ops.filter((o) => o.type === "transposition").map((o) => o.baseChars.join(""));
+  assert.deepEqual(blocks.sort(), ["丁丁", "乙"]);
+  // 同一输入永远同一结果（确定性）
+  const again = alignDetailed([..."甲丁丁乙丙丙戊"], toks("甲丙丙乙丁丁戊"));
+  assert.deepEqual(again.ops, r.ops);
+});
+
+test("换位：与缺页相邻时结果确定", () => {
+  // 「甲乙」移到缺页之前，缺页覆盖末尾「戊」
+  const tokens = [...toks("丙丁"), gapToken(), ...toks("甲乙")];
+  const r = alignDetailed([..."甲乙丙丁戊"], tokens);
+  assert.equal(r.cost, 1);
+  assert.equal(r.stats.transposition, 1);
+  assert.equal(r.stats.missing, 0);
+  assert.equal(r.stats.missingPage, 1);
+  assert.deepEqual(r.ops.find((o) => o.type === "missing_page").chars, ["戊"]);
+  // 同一输入永远同一结果
+  const again = alignDetailed([..."甲乙丙丁戊"], [...toks("丙丁"), gapToken(), ...toks("甲乙")]);
+  assert.deepEqual(again.ops, r.ops);
+});
+
+test("无满足约束的换位时按插入和缺失处理", () => {
+  // 内容不同的块不得凑成换位
+  let r = alignDetailed([..."甲乙"], toks("甲丙"));
+  assert.equal(r.stats.transposition, 0);
+  assert.equal(r.stats.substitute, 1);
+  assert.equal(r.cost, 1);
+  r = alignDetailed([..."甲乙丙"], toks("甲丙"));
+  assert.equal(r.stats.transposition, 0);
+  assert.equal(r.stats.missing, 1);
+  assert.equal(r.cost, 1);
+});
+
+test("正反一致：同一对版本两个方向代价相同", async () => {
+  const text = await makeText();
+  const cases = [
+    cols("甲乙丙丁戊己庚辛壬癸"), // 长块移动对
+    cols("己庚辛壬癸甲乙丙丁戊"),
+    cols("甲乙丙丁戊己庚辛壬癸子"), // 远距单字移动对
+    cols("甲丙丁戊己庚辛壬癸子乙")
+  ];
+  const ids = [];
+  for (let i = 0; i < cases.length; i++) {
+    const r = await addVersion(text.id, `v${i + 1}`, cases[i]);
+    ids.push(r.body.data.id);
+  }
+  const q = await api("GET", `/texts/${text.id}/collation`);
+  const { matrix, costs } = q.body.data;
+  // 矩阵对称：任意两个版本正反同价
+  for (const a of ids) {
+    for (const b of ids) {
+      if (a === b) continue;
+      assert.equal(matrix[a][b], matrix[b][a], `${a} vs ${b} 不对称`);
+    }
+  }
+  // 长块移动与远距移动的代价都是 1（一缺一插的加倍已消除）
+  assert.equal(matrix[ids[0]][ids[1]], 1);
+  assert.equal(matrix[ids[2]][ids[3]], 1);
+  // 总编辑代价与对称矩阵一致
+  for (const a of ids) {
+    const sum = ids.filter((b) => b !== a).reduce((s, b) => s + matrix[a][b], 0);
+    assert.equal(costs[a], sum);
+  }
+});
+
+test("正反一致：小字表上有向代价穷举对称", () => {
+  // {甲,乙} 上长度 1..3 的全部串两两有向比较，代价必须相等
+  const strs = [];
+  for (let l = 1; l <= 3; l++) {
+    const prev = l === 1 ? [""] : strs.filter((s) => s.length === l - 1);
+    for (const p of prev) for (const c of ["甲", "乙"]) strs.push(p + c);
+  }
+  for (const a of strs) {
+    for (const b of strs) {
+      const ab = alignDetailed([...a], toks(b)).cost;
+      const ba = alignDetailed([...b], toks(a)).cost;
+      assert.equal(ab, ba, `「${a}」→「${b}」=${ab} 但反向=${ba}`);
+    }
+  }
 });
